@@ -388,7 +388,9 @@ class GitProvider(ABC):
                         pr_comment_updated = pr_comment
                     get_logger().info(f"Persistent mode - updating comment {comment_url} to latest {name} message")
                     # response = self.mr.notes.update(comment.id, {'body': pr_comment_updated})
-                    self.edit_comment(comment, pr_comment_updated)
+                    edit_result = self.edit_comment(comment, pr_comment_updated)
+                    if edit_result is False:
+                        raise RuntimeError("Failed to update persistent comment")
                     if as_thread:
                         try:
                             # Reopen the thread if it was resolved, so the developer revisits the updated review.
