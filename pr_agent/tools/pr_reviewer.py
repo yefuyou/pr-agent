@@ -296,7 +296,9 @@ class PRReviewer:
             return False
         if not settings.pr_reviewer.get("persistent_finding_state", True):
             return False
-        publisher = getattr(self.git_provider, "publish_persistent_comment", None)
+        # getattr on self too: this runs inside the parse-failure guard, which is
+        # reached by callers holding a bare instance (see test_load_yaml_unparseable).
+        publisher = getattr(getattr(self, "git_provider", None), "publish_persistent_comment", None)
         if getattr(publisher, "__func__", None) is GitProvider.publish_persistent_comment:
             # Skip generic publishers; they only create comments and cannot safely carry lifecycle state.
             return False
