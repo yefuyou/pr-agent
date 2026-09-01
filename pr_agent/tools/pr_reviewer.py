@@ -34,6 +34,7 @@ from pr_agent.algo.utils import (
     convert_to_markdown_v2,
     github_action_output,
     load_yaml,
+    push_outputs,
     show_relevant_configurations,
     show_run_details,
 )
@@ -612,6 +613,12 @@ class PRReviewer:
                 self._review_state_result.state,
                 max_chars=self._review_comment_max_chars(),
             )
+
+        # Emit the review to optional external sinks (stdout/file/webhook/slack); no-op unless enabled.
+        # publish_output gates it so a dry run makes no external calls. The "no major issues"
+        # suppression deliberately does not: that only silences the PR comment.
+        if get_settings().config.publish_output:
+            push_outputs("review", payload=data.get('review', {}), markdown=markdown_text)
 
         # Add custom labels from the review prediction (effort, security)
         self.set_review_labels(data)
