@@ -23,15 +23,18 @@ from pr_agent.algo.review_finding_state import (
     parse_review_state,
     reconcile_review_findings,
 )
-from pr_agent.algo.run_details import init_run_details
+from pr_agent.algo.run_details import get_run_details, init_run_details
 from pr_agent.algo.skills_loader import get_skills_context
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import (
     ModelType,
     PRReviewHeader,
+    PRReviewIdentity,
+    add_pr_review_identity,
     convert_to_markdown_v2,
     github_action_output,
     load_yaml,
+    push_outputs,
     show_relevant_configurations,
     show_run_details,
 )
@@ -97,10 +100,10 @@ class PRReviewer:
         if (self.pr_description_files and get_settings().get("config.is_auto_command", False) and
                 get_settings().get("config.enable_ai_metadata", False)):
             add_ai_metadata_to_diff_files(self.git_provider, self.pr_description_files)
-            get_logger().debug(f"AI metadata added to the this command")
+            get_logger().debug("AI metadata added to the this command")
         else:
             get_settings().set("config.enable_ai_metadata", False)
-            get_logger().debug(f"AI metadata is disabled for this command")
+            get_logger().debug("AI metadata is disabled for this command")
 
         self.vars = {
             "title": self.git_provider.pr.title,
@@ -113,6 +116,9 @@ class PRReviewer:
             "require_score": get_settings().pr_reviewer.require_score_review,
             "require_tests": get_settings().pr_reviewer.require_tests_review,
             "require_estimate_effort_to_review": get_settings().pr_reviewer.require_estimate_effort_to_review,
+            "require_risk_assessment": get_settings().pr_reviewer.get("require_risk_assessment", False),
+            "require_merge_recommendation": get_settings().pr_reviewer.get("require_merge_recommendation", False),
+            "require_priority_files": get_settings().pr_reviewer.get("require_priority_files", False),
             "require_estimate_contribution_time_cost": get_settings().pr_reviewer.require_estimate_contribution_time_cost,
             'require_can_be_split_review': get_settings().pr_reviewer.require_can_be_split_review,
             'require_security_review': get_settings().pr_reviewer.require_security_review,
@@ -149,6 +155,8 @@ class PRReviewer:
 
     async def run(self) -> None:
         init_run_details()
+        progress_response = None
+        review_failed = False
         try:
             if not self.git_provider.get_files():
                 get_logger().info(f"PR has no files: {self.pr_url}, skipping review")
@@ -188,15 +196,14 @@ class PRReviewer:
                 return None
 
             if get_settings().config.publish_output and not get_settings().config.get('is_auto_command', False):
-                self.git_provider.publish_comment("Preparing review...", is_temporary=True)
+                progress_response = self.git_provider.publish_comment("Preparing review...", is_temporary=True)
 
             await retry_with_fallback_models(self._prepare_prediction, model_type=ModelType.REGULAR)
             if not self.prediction:
-                self.git_provider.remove_initial_comment()
                 return None
 
             pr_review = self._prepare_pr_review()
-            get_logger().debug(f"PR output", artifact=pr_review)
+            get_logger().debug("PR output", artifact=pr_review)
 
             state_result = getattr(self, "_review_state_result", None)
             state_changed = bool(state_result and state_result.changed)
@@ -240,24 +247,47 @@ class PRReviewer:
             elif get_settings().pr_reviewer.persistent_comment and not self.incremental.is_incremental:
                 final_update_message = get_settings().pr_reviewer.final_update_message
                 persistent_args = dict(
-                    initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
+                    initial_header=pr_review.split("\n", 1)[0],
                     update_header=True,
                     final_update_message=final_update_message,
+                    identity_marker=PRReviewIdentity.REGULAR.value,
+                    legacy_initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
                     **review_thread_kwargs,
                 )
                 if state_result is not None:
+                    # Finding state was persisted into this comment. A failed edit must not
+                    # fall back to publishing a fresh comment: that would strand the state in
+                    # the old one and show the reader two persistent reviews.
                     persistent_args["fallback_on_error"] = False
                     self.git_provider.publish_persistent_comment_full(pr_review, **persistent_args)
                 else:
                     self.git_provider.publish_persistent_comment(pr_review, **persistent_args)
             else:
+                if self.git_provider.supports_review_comment_identity() is True:
+                    identity_marker = (
+                        PRReviewIdentity.INCREMENTAL.value
+                        if self.incremental.is_incremental
+                        else PRReviewIdentity.REGULAR.value
+                    )
+                    pr_review = add_pr_review_identity(pr_review, identity_marker)
                 self.git_provider.publish_comment(pr_review, **review_thread_kwargs)
-
-            self.git_provider.remove_initial_comment()
         except Exception as e:
+            review_failed = True
             get_logger().error(f"Failed to review PR: {e}")
             if get_settings().config.get("propagate_tool_errors", False):
                 raise
+        finally:
+            if progress_response is not None:
+                try:
+                    self.git_provider.remove_comment(progress_response)
+                except Exception as e:
+                    get_logger().exception(f"Failed to remove review progress comment, error: {e}")
+            if (review_failed and get_settings().config.publish_output and
+                    not get_settings().config.get("is_auto_command", False)):
+                try:
+                    self.git_provider.publish_comment("Failed to review PR")
+                except Exception as e:
+                    get_logger().exception(f"Failed to publish review failure result, error: {e}")
 
     def _review_finding_state_enabled(self) -> bool:
         settings = get_settings()
@@ -267,7 +297,9 @@ class PRReviewer:
             return False
         if not settings.pr_reviewer.get("persistent_finding_state", True):
             return False
-        publisher = getattr(self.git_provider, "publish_persistent_comment", None)
+        # getattr on self too: this runs inside the parse-failure guard, which is
+        # reached by callers holding a bare instance (see test_load_yaml_unparseable).
+        publisher = getattr(getattr(self, "git_provider", None), "publish_persistent_comment", None)
         if getattr(publisher, "__func__", None) is GitProvider.publish_persistent_comment:
             # Skip generic publishers; they only create comments and cannot safely carry lifecycle state.
             return False
@@ -456,7 +488,7 @@ class PRReviewer:
             self.remaining_files_list = []
 
         if self.patches_diff:
-            get_logger().debug(f"PR diff", diff=self.patches_diff)
+            get_logger().debug("PR diff", diff=self.patches_diff)
             self.prediction = await self._get_prediction(model)
         else:
             get_logger().warning(f"Empty diff for PR: {self.pr_url}")
@@ -496,7 +528,8 @@ class PRReviewer:
         first_key = 'review'
         last_key = 'security_concerns'
         data = load_yaml(self.prediction.strip(),
-                         keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "security_concerns:", "key_issues_to_review:",
+                         keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "risk_level:",
+                                        "merge_recommendation:", "security_concerns:", "key_issues_to_review:",
                                         "relevant_file:", "relevant_line:", "suggestion:"],
                          first_key=first_key, last_key=last_key)
         github_action_output(data, 'review')
@@ -508,6 +541,24 @@ class PRReviewer:
                 get_logger().warning("Review data is invalid; preserving persistent finding state")
             get_logger().exception("Failed to parse review data", artifact={"data": data})
             return ""
+
+        structured_publisher = getattr(self.git_provider, "publish_structured_review", None)
+        if callable(structured_publisher):
+            # Deep-copy the data: dict(data) is shallow, so structured_data["review"]
+            # would alias data["review"], which is mutated right below (key reordering).
+            # Hand implementers an isolated snapshot, since the hook is provider-neutral
+            # and a provider that defers serialization would observe the mutation.
+            structured_data = copy.deepcopy(data)
+            details = get_run_details()
+            usage = {}
+            if details is not None and details.has_token_usage:
+                usage = {
+                    "prompt_tokens": details.prompt_tokens,
+                    "completion_tokens": details.completion_tokens,
+                    "total_tokens": details.total_tokens,
+                }
+            structured_data["usage"] = usage
+            structured_publisher(structured_data)
 
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary
         if 'key_issues_to_review' in data['review']:
@@ -562,6 +613,12 @@ class PRReviewer:
                 self._review_state_result.state,
                 max_chars=self._review_comment_max_chars(),
             )
+
+        # Emit the review to optional external sinks (stdout/file/webhook/slack); no-op unless enabled.
+        # publish_output gates it so a dry run makes no external calls. The "no major issues"
+        # suppression deliberately does not: that only silences the PR comment.
+        if get_settings().config.publish_output:
+            push_outputs("review", payload=data.get('review', {}), markdown=markdown_text)
 
         # Add custom labels from the review prediction (effort, security)
         self.set_review_labels(data)
@@ -821,13 +878,14 @@ class PRReviewer:
         if not get_settings().pr_reviewer.require_security_review:
             get_settings().pr_reviewer.enable_review_labels_security = False # we did not generate this output
 
-        if (get_settings().pr_reviewer.enable_review_labels_security or
-                get_settings().pr_reviewer.enable_review_labels_effort):
+        if ((get_settings().pr_reviewer.enable_review_labels_security or
+                get_settings().pr_reviewer.enable_review_labels_effort) and
+                self.git_provider.is_supported("get_labels")):
             try:
                 review_labels = []
                 if get_settings().pr_reviewer.enable_review_labels_effort:
                     estimated_effort = data['review']['estimated_effort_to_review_[1-5]']
-                    estimated_effort_number = 0
+                    estimated_effort_number = None
                     if isinstance(estimated_effort, str):
                         try:
                             estimated_effort_number = int(estimated_effort.split(',')[0])
@@ -837,7 +895,8 @@ class PRReviewer:
                         estimated_effort_number = estimated_effort
                     else:
                         get_logger().warning(f"Unexpected type for estimated_effort: {type(estimated_effort)}")
-                    if 1 <= estimated_effort_number <= 5:  # 1, because ...
+                    if estimated_effort_number is not None:
+                        estimated_effort_number = max(1, min(5, int(estimated_effort_number)))
                         review_labels.append(f'Review effort {estimated_effort_number}/5')
                 if get_settings().pr_reviewer.enable_review_labels_security and get_settings().pr_reviewer.require_security_review:
                     security_concerns = data['review']['security_concerns']  # yes, because ...

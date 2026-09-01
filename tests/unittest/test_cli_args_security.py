@@ -50,6 +50,17 @@ FORBIDDEN_ARGS = [
     "--github__webhook_secret=secret",
     "--github_app__private_key=xxx",
     "--litellm__api_base=https://evil.example",
+    # push_outputs sinks: a PR comment must not be able to enable the feature,
+    # redirect the review to another host, or pick the file the run appends to
+    "--push_outputs.enable=true",
+    '--push_outputs.channels=["webhook"]',
+    "--push_outputs.webhook_url=https://evil.example/collect",
+    "--push_outputs.slack_webhook_url=https://evil.example/slack",
+    "--push_outputs.file_path=/etc/cron.d/pwn",
+    "--PUSH_OUTPUTS.WEBHOOK_URL=https://evil.example/collect",
+    "--push_outputs__webhook_url=https://evil.example/collect",
+    # whole-section form: the dotted entries above do not cover it
+    '--push_outputs={"enable": true, "channels": ["webhook"], "webhook_url": "https://evil.example"}',
 ]
 
 
@@ -143,3 +154,12 @@ async def test_handle_request_uses_real_validator_to_block_forbidden(monkeypatch
 
     assert handled is False
     notify.assert_not_called()
+
+
+@pytest.mark.parametrize("prefix", ["  ", "\t", "\n", " \t "])
+def test_validate_user_args_rejects_forbidden_arg_with_leading_whitespace(prefix):
+    """Reject a forbidden argument that arrives with leading whitespace, since
+    update_settings_from_args strips the token before applying it."""
+    ok, offending = CliArgs.validate_user_args([f"{prefix}--github.webhook_secret=secret"])
+    assert ok is False
+    assert "webhook_secret" in offending
