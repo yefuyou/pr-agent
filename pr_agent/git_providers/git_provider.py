@@ -440,9 +440,20 @@ class GitProvider(ABC):
                                    final_update_message=True,
                                    as_thread: bool = False,
                                    identity_marker: str | None = None,
-                                   legacy_initial_header: str | None = None,
-                                   fallback_on_error: bool = True):
+                                   legacy_initial_header: str | None = None):
         return self.publish_comment(pr_comment, **({'as_thread': True} if as_thread else {}))
+
+    @staticmethod
+    def _get_comment_body(comment) -> str:
+        """Read a comment's body whether the provider returns an object or a dict.
+
+        Bitbucket and Azure DevOps hand back dicts, which have no .body attribute.
+        Reading it directly raises, and the surrounding except Exception swallows
+        that into a silent fallback that publishes a duplicate comment.
+        """
+        if isinstance(comment, dict):
+            return comment.get("body", "")
+        return getattr(comment, "body", "")
 
     def publish_persistent_comment_full(self, pr_comment: str,
                                    initial_header: str,
@@ -451,7 +462,8 @@ class GitProvider(ABC):
                                    final_update_message=True,
                                    as_thread: bool = False,
                                    identity_marker: str | None = None,
-                                   legacy_initial_header: str | None = None):
+                                   legacy_initial_header: str | None = None,
+                                   fallback_on_error: bool = True):
         try:
             pr_comment = add_pr_review_identity(pr_comment, identity_marker)
             prev_comments = list(self.get_issue_comments())
@@ -460,13 +472,18 @@ class GitProvider(ABC):
                 if identity_marker
                 else [initial_header]
             )
+            # reversed(): take the LATEST matching comment. Iterating forward picks the
+            # oldest, which on a PR that has been reviewed several times updates a stale
+            # comment and leaves the current one behind.
+            # _get_comment_body(): some providers return comments as dicts, which have no
+            # .body attribute and would raise here.
             comment_to_update = next(
                 (
                     comment
                     for identifier in identifiers
                     if identifier
-                    for comment in prev_comments
-                    if comment_matches_identity(comment.body, identifier)
+                    for comment in reversed(prev_comments)
+                    if comment_matches_identity(GitProvider._get_comment_body(comment), identifier)
                 ),
                 None,
             )
